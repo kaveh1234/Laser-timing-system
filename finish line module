@@ -1,0 +1,271 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Define pins
+#define LCD_SCL 22
+#define LCD_SDA 21
+#define READY_LED 32
+#define LASER_ALIGNED_LED 33
+#define CONNECTION_FAIL_LED 25
+#define CONNECTION_SUCCESS_LED 26
+#define BUZZER 18
+#define LASER_SENSOR 19
+
+// MAC Address of the sender (start line module)
+uint8_t broadcastAddress[] = {0x08, 0xA6, 0xF7, 0x65, 0xEF, 0x18};
+
+// Define variables
+bool laserAligned = false;
+bool connectionActive = false;
+bool readyToTime = false;
+bool timingCycleActive = false;
+unsigned long lastHeartbeatSent = 0;
+unsigned long lastHeartbeatReceived = 0;
+unsigned long startTime = 0;
+unsigned long finishTime = 0;
+unsigned long elapsedTime = 0;
+unsigned long timingDisplayEndTime = 0;
+const unsigned long HEARTBEAT_INTERVAL = 1000; // Send heartbeat every 1 second
+const unsigned long CONNECTION_TIMEOUT = 3000; // Connection timeout after 3 seconds
+const unsigned long DISPLAY_DURATION = 60000; // Display time for 1 minute (60000ms)
+
+// Initialize LCD (20 columns, 4 rows)
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Structure to send data
+typedef struct message_struct {
+  int messageType; // 0: Heartbeat, 1: Start timing, 2: Ready state
+  bool status;
+} message_struct;
+
+message_struct outgoingMessage;
+message_struct incomingMessage;
+
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    digitalWrite(CONNECTION_SUCCESS_LED, HIGH);
+    digitalWrite(CONNECTION_FAIL_LED, LOW);
+  } else {
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+  }
+}
+
+// Callback when data is received
+void OnDataReceive(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+  
+  if (incomingMessage.messageType == 0) { // Heartbeat
+    lastHeartbeatReceived = millis();
+    connectionActive = true;
+  } else if (incomingMessage.messageType == 1) { // Start timing
+    if (readyToTime) {
+      startTime = micros();
+      timingCycleActive = true;
+      
+      // Short beep to indicate timing started
+      digitalWrite(BUZZER, HIGH);
+      delay(100);
+      digitalWrite(BUZZER, LOW);
+      
+      lcd.clear();
+      lcd.setCursor(0, 1);
+      lcd.print("Timing in progress...");
+    }
+  } else if (incomingMessage.messageType == 2) { // Ready state update from start line
+    // Check if start line is ready
+    if (!incomingMessage.status) {
+      readyToTime = false;
+      updateLCD();
+    }
+  }
+}
+
+// Interrupt handler for laser sensor
+void IRAM_ATTR laserInterrupt() {
+  if (timingCycleActive) {
+    finishTime = micros();
+    elapsedTime = finishTime - startTime;
+    timingCycleActive = false;
+    timingDisplayEndTime = millis() + DISPLAY_DURATION;
+    
+    // Long beep to indicate finish
+    digitalWrite(BUZZER, HIGH);
+    delay(200);
+    digitalWrite(BUZZER, LOW);
+  }
+}
+
+// Update LCD display
+void updateLCD() {
+  lcd.clear();
+  
+  if (!connectionActive) {
+    lcd.setCursor(0, 1);
+    lcd.print("Connection lost...");
+  } else if (!laserAligned) {
+    lcd.setCursor(0, 1);
+    lcd.print("Align laser beam...");
+  } else if (!readyToTime) {
+    lcd.setCursor(0, 1);
+    lcd.print("Setting up...");
+  } else if (timingCycleActive) {
+    lcd.setCursor(0, 1);
+    lcd.print("Timing in progress...");
+  } else if (millis() < timingDisplayEndTime) {
+    // Display time in xx.xxxs format
+    float seconds = elapsedTime / 1000000.0;
+    lcd.setCursor(0, 0);
+    lcd.print("Time:");
+    lcd.setCursor(0, 1);
+    char timeStr[10];
+    sprintf(timeStr, "%02d.%03ds", int(seconds), int(seconds * 1000) % 1000);
+    lcd.print(timeStr);
+    
+    lcd.setCursor(0, 3);
+    lcd.print("Next timing in: ");
+    
+    // Show countdown
+    unsigned long remaining = (timingDisplayEndTime - millis()) / 1000;
+    lcd.setCursor(16, 3);
+    lcd.print(remaining);
+    lcd.print("s ");
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print("Ready to time");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize I2C for LCD
+  Wire.begin(LCD_SDA, LCD_SCL);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Laser Timer System");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  
+  // Initialize pins
+  pinMode(READY_LED, OUTPUT);
+  pinMode(LASER_ALIGNED_LED, OUTPUT);
+  pinMode(CONNECTION_FAIL_LED, OUTPUT);
+  pinMode(CONNECTION_SUCCESS_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LASER_SENSOR, INPUT_PULLUP);
+  
+  // All LEDs off initially
+  digitalWrite(READY_LED, LOW);
+  digitalWrite(LASER_ALIGNED_LED, LOW);
+  digitalWrite(CONNECTION_FAIL_LED, LOW);
+  digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+  
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    lcd.setCursor(0, 2);
+    lcd.print("ESP-NOW Error!");
+    return;
+  }
+
+  // Register send callback
+  esp_now_register_send_cb(OnDataSent);
+  
+  // Register peer
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  // Add peer        
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    lcd.setCursor(0, 2);
+    lcd.print("Peer Error!");
+    return;
+  }
+  
+  // Register callback function for received data
+  esp_now_register_recv_cb(OnDataReceive);
+  
+  // Attach interrupt for laser sensor
+  attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), laserInterrupt, FALLING);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Laser Timer System");
+  lcd.setCursor(0, 1);
+  lcd.print("Waiting for setup...");
+}
+
+void loop() {
+  // Check laser alignment
+  laserAligned = !digitalRead(LASER_SENSOR); // Assuming LOW means laser is aligned
+  digitalWrite(LASER_ALIGNED_LED, laserAligned ? HIGH : LOW);
+  
+  // Send heartbeat
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastHeartbeatSent >= HEARTBEAT_INTERVAL) {
+    lastHeartbeatSent = currentMillis;
+    outgoingMessage.messageType = 0; // Heartbeat
+    outgoingMessage.status = true;
+    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+  }
+  
+  // Check if connection is active
+  if (currentMillis - lastHeartbeatReceived >= CONNECTION_TIMEOUT) {
+    connectionActive = false;
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+  }
+  
+  // Update ready to time state
+  bool newReadyState = laserAligned && connectionActive && (millis() >= timingDisplayEndTime || timingDisplayEndTime == 0);
+  if (readyToTime != newReadyState) {
+    readyToTime = newReadyState;
+    digitalWrite(READY_LED, readyToTime ? HIGH : LOW);
+    
+    // Send ready state update to start line
+    outgoingMessage.messageType = 2; // Ready state
+    outgoingMessage.status = readyToTime;
+    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+    
+    // Beep when ready state changes
+    if (readyToTime) {
+      digitalWrite(BUZZER, HIGH);
+      delay(200);
+      digitalWrite(BUZZER, LOW);
+    }
+    
+    updateLCD();
+  }
+  
+  // Check if timing display should be updated
+  if (millis() < timingDisplayEndTime && !timingCycleActive) {
+    static unsigned long lastLCDUpdate = 0;
+    if (currentMillis - lastLCDUpdate >= 1000) { // Update every second
+      lastLCDUpdate = currentMillis;
+      updateLCD();
+    }
+  }
+  
+  // Reset timing cycle if needed
+  if (timingCycleActive && !readyToTime) {
+    timingCycleActive = false;
+    updateLCD();
+  }
+  
+  delay(10); // Small delay to prevent CPU overload
+}
