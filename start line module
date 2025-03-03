@@ -1,0 +1,170 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// Define pins
+#define READY_LED 32
+#define LASER_ALIGNED_LED 33
+#define CONNECTION_FAIL_LED 25
+#define CONNECTION_SUCCESS_LED 26
+#define BUZZER 22
+#define LASER_SENSOR 23
+
+// MAC Address of the receiver (finish line module)
+uint8_t broadcastAddress[] = {0xE8, 0x6B, 0xEA, 0xDF, 0xA2, 0x68};
+
+// Define variables
+bool laserAligned = false;
+bool connectionActive = false;
+bool readyToTime = false;
+bool timingCycleActive = false;
+unsigned long lastHeartbeatSent = 0;
+unsigned long lastHeartbeatReceived = 0;
+const unsigned long HEARTBEAT_INTERVAL = 1000; // Send heartbeat every 1 second
+const unsigned long CONNECTION_TIMEOUT = 3000; // Connection timeout after 3 seconds
+
+// Structure to send data
+typedef struct message_struct {
+  int messageType; // 0: Heartbeat, 1: Start timing, 2: Ready state
+  bool status;
+} message_struct;
+
+message_struct outgoingMessage;
+message_struct incomingMessage;
+
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    digitalWrite(CONNECTION_SUCCESS_LED, HIGH);
+    digitalWrite(CONNECTION_FAIL_LED, LOW);
+  } else {
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+  }
+}
+
+// Callback when data is received
+void OnDataReceive(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+  
+  if (incomingMessage.messageType == 0) { // Heartbeat
+    lastHeartbeatReceived = millis();
+    connectionActive = true;
+  } else if (incomingMessage.messageType == 2) { // Ready state update from finish line
+    if (!incomingMessage.status) {
+      readyToTime = false;
+    }
+  }
+}
+
+// Interrupt handler for laser sensor
+void IRAM_ATTR laserInterrupt() {
+  if (readyToTime && !timingCycleActive) {
+    timingCycleActive = true;
+    // Send start timing signal
+    outgoingMessage.messageType = 1;
+    outgoingMessage.status = true;
+    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+    
+    // Short beep to indicate start
+    digitalWrite(BUZZER, HIGH);
+    delay(100);
+    digitalWrite(BUZZER, LOW);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(READY_LED, OUTPUT);
+  pinMode(LASER_ALIGNED_LED, OUTPUT);
+  pinMode(CONNECTION_FAIL_LED, OUTPUT);
+  pinMode(CONNECTION_SUCCESS_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LASER_SENSOR, INPUT_PULLUP);
+  
+  // All LEDs off initially
+  digitalWrite(READY_LED, LOW);
+  digitalWrite(LASER_ALIGNED_LED, LOW);
+  digitalWrite(CONNECTION_FAIL_LED, LOW);
+  digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+  
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register send callback
+  esp_now_register_send_cb(OnDataSent);
+  
+  // Register peer
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  // Add peer        
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
+  
+  // Register callback function for received data
+  esp_now_register_recv_cb(OnDataReceive);
+  
+  // Attach interrupt for laser sensor
+  attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), laserInterrupt, FALLING);
+}
+
+void loop() {
+  // Check laser alignment
+  laserAligned = !digitalRead(LASER_SENSOR); // Assuming LOW means laser is aligned
+  digitalWrite(LASER_ALIGNED_LED, laserAligned ? HIGH : LOW);
+  
+  // Send heartbeat
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastHeartbeatSent >= HEARTBEAT_INTERVAL) {
+    lastHeartbeatSent = currentMillis;
+    outgoingMessage.messageType = 0; // Heartbeat
+    outgoingMessage.status = true;
+    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+  }
+  
+  // Check if connection is active
+  if (currentMillis - lastHeartbeatReceived >= CONNECTION_TIMEOUT) {
+    connectionActive = false;
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+  }
+  
+  // Update ready to time state
+  bool newReadyState = laserAligned && connectionActive;
+  if (readyToTime != newReadyState) {
+    readyToTime = newReadyState;
+    digitalWrite(READY_LED, readyToTime ? HIGH : LOW);
+    
+    // Send ready state update to finish line
+    outgoingMessage.messageType = 2; // Ready state
+    outgoingMessage.status = readyToTime;
+    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+    
+    // Beep when ready state changes
+    if (readyToTime) {
+      digitalWrite(BUZZER, HIGH);
+      delay(200);
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+  
+  // Reset timing cycle if needed
+  if (timingCycleActive && !readyToTime) {
+    timingCycleActive = false;
+  }
+  
+  delay(10); // Small delay to prevent CPU overload
+}
