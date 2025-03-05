@@ -1,7 +1,8 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 
-// Define pins
+// Define pin assignments
 #define READY_LED 32
 #define LASER_ALIGNED_LED 33
 #define CONNECTION_FAIL_LED 25
@@ -9,70 +10,162 @@
 #define BUZZER 22
 #define LASER_SENSOR 23
 
-// MAC Address of the receiver (finish line module)
-uint8_t broadcastAddress[] = {0xE8, 0x6B, 0xEA, 0xDF, 0xA2, 0x68};
+// CORRECTED: Using the MAC address from the finish line module code
+uint8_t finishLineMacAddress[] = {0xE8, 0x6B, 0xEA, 0xDF, 0xA2, 0x68};
 
-// Define variables
-bool laserAligned = false;
+// Timing variables
+volatile bool laserAligned = false;
 bool connectionActive = false;
 bool readyToTime = false;
 bool timingCycleActive = false;
-unsigned long lastHeartbeatSent = 0;
+
+// Communication variables
+typedef struct struct_message {
+  uint8_t msgType;  // 0 for heartbeat, 1 for start timing
+  bool localAligned;
+  bool cooldown;
+} struct_message;
+
+struct_message outgoingMsg;
+struct_message incomingMsg;
+
+// Last time we received a heartbeat from the finish line
 unsigned long lastHeartbeatReceived = 0;
+const unsigned long HEARTBEAT_TIMEOUT = 3000;  // 3 seconds timeout
 const unsigned long HEARTBEAT_INTERVAL = 1000; // Send heartbeat every 1 second
-const unsigned long CONNECTION_TIMEOUT = 3000; // Connection timeout after 3 seconds
+unsigned long lastHeartbeatSent = 0;
+bool remoteAligned = false;
+bool remoteCooldown = false;
 
-// Structure to send data
-typedef struct message_struct {
-  int messageType; // 0: Heartbeat, 1: Start timing, 2: Ready state
-  bool status;
-} message_struct;
-
-message_struct outgoingMessage;
-message_struct incomingMessage;
+// Function prototypes
+void sendHeartbeat();
+void sendStartSignal();
+void initESPNow();
+void updateReadyToTime();
 
 // Callback when data is sent
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    digitalWrite(CONNECTION_SUCCESS_LED, HIGH);
-    digitalWrite(CONNECTION_FAIL_LED, LOW);
-  } else {
-    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  if (status != ESP_NOW_SEND_SUCCESS) {
     digitalWrite(CONNECTION_FAIL_LED, HIGH);
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+    connectionActive = false;
+  } else {
+    digitalWrite(CONNECTION_FAIL_LED, LOW);
+    digitalWrite(CONNECTION_SUCCESS_LED, HIGH);
   }
 }
 
-// Callback when data is received
-void OnDataReceive(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+// Callback when data is received - using the newer ESP-NOW API format
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  memcpy(&incomingMsg, incomingData, sizeof(incomingMsg));
   
-  if (incomingMessage.messageType == 0) { // Heartbeat
+  if (incomingMsg.msgType == 0) {  // Heartbeat message
     lastHeartbeatReceived = millis();
     connectionActive = true;
-  } else if (incomingMessage.messageType == 2) { // Ready state update from finish line
-    if (!incomingMessage.status) {
-      readyToTime = false;
-    }
+    remoteAligned = incomingMsg.localAligned;
+    remoteCooldown = incomingMsg.cooldown;
+    
+    // Update ready to time status
+    updateReadyToTime();
   }
 }
 
-// Interrupt handler for laser sensor
-void IRAM_ATTR laserInterrupt() {
+// Interrupt service routine for laser break detection
+void IRAM_ATTR laserBreakISR() {
+  // This will be called when beam is broken (sensor goes from HIGH to LOW)
   if (readyToTime && !timingCycleActive) {
     timingCycleActive = true;
-    // Send start timing signal
-    outgoingMessage.messageType = 1;
-    outgoingMessage.status = true;
-    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
-    
-    // Short beep to indicate start
-    digitalWrite(BUZZER, HIGH);
-    delay(100);
-    digitalWrite(BUZZER, LOW);
+    sendStartSignal();
+    tone(BUZZER, 1000, 100);  // Beep to indicate timing start
+  }
+}
+
+// Update the laser aligned status
+void updateLaserStatus() {
+  // Laser sensor returns HIGH when beam is detected, LOW when broken
+  laserAligned = digitalRead(LASER_SENSOR) == HIGH;
+  
+  // Update LED
+  digitalWrite(LASER_ALIGNED_LED, laserAligned ? HIGH : LOW);
+}
+
+// Update the ready to time status
+void updateReadyToTime() {
+  readyToTime = laserAligned && remoteAligned && connectionActive && !remoteCooldown && !timingCycleActive;
+  digitalWrite(READY_LED, readyToTime ? HIGH : LOW);
+}
+
+// Initialize ESP-NOW
+void initESPNow() {
+  WiFi.mode(WIFI_STA);
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  
+  esp_now_register_send_cb(OnDataSent);
+  
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, finishLineMacAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+  
+  esp_now_register_recv_cb(OnDataRecv);
+}
+
+// Send heartbeat message to finish line module
+void sendHeartbeat() {
+  outgoingMsg.msgType = 0;
+  outgoingMsg.localAligned = laserAligned;
+  outgoingMsg.cooldown = false;
+  
+  esp_err_t result = esp_now_send(finishLineMacAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+  
+  if (result != ESP_OK) {
+    connectionActive = false;
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  }
+}
+
+// Send start timing signal
+void sendStartSignal() {
+  outgoingMsg.msgType = 1;  // Start timing message
+  outgoingMsg.localAligned = laserAligned;
+  outgoingMsg.cooldown = false;
+  
+  esp_err_t result = esp_now_send(finishLineMacAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+  
+  if (result != ESP_OK) {
+    connectionActive = false;
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  }
+}
+
+void checkConnection() {
+  // Check if we haven't received a heartbeat for too long
+  if (millis() - lastHeartbeatReceived > HEARTBEAT_TIMEOUT) {
+    connectionActive = false;
+    digitalWrite(CONNECTION_FAIL_LED, HIGH);
+    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+  }
+  
+  // Send periodic heartbeats
+  if (millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeatSent = millis();
   }
 }
 
 void setup() {
+  // Initialize serial for debugging
   Serial.begin(115200);
   
   // Initialize pins
@@ -81,90 +174,38 @@ void setup() {
   pinMode(CONNECTION_FAIL_LED, OUTPUT);
   pinMode(CONNECTION_SUCCESS_LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
-  pinMode(LASER_SENSOR, INPUT_PULLUP);
+  pinMode(LASER_SENSOR, INPUT);
   
-  // All LEDs off initially
+  // Set initial LED states
   digitalWrite(READY_LED, LOW);
   digitalWrite(LASER_ALIGNED_LED, LOW);
-  digitalWrite(CONNECTION_FAIL_LED, LOW);
+  digitalWrite(CONNECTION_FAIL_LED, HIGH);
   digitalWrite(CONNECTION_SUCCESS_LED, LOW);
-  digitalWrite(BUZZER, LOW);
   
-  // Set device as a Wi-Fi Station
-  WiFi.mode(WIFI_STA);
-
   // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-
-  // Register send callback
-  esp_now_register_send_cb(OnDataSent);
+  initESPNow();
   
-  // Register peer
-  esp_now_peer_info_t peerInfo;
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;  
-  peerInfo.encrypt = false;
+  // Attach interrupt for laser break detection - FALLING edge when beam is broken
+  attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), laserBreakISR, FALLING);
   
-  // Add peer        
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer");
-    return;
-  }
-  
-  // Register callback function for received data
-  esp_now_register_recv_cb(OnDataReceive);
-  
-  // Attach interrupt for laser sensor
-  attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), laserInterrupt, FALLING);
+  Serial.println("Start Line Module Initialized");
 }
 
 void loop() {
-  // Check laser alignment
-  laserAligned = !digitalRead(LASER_SENSOR); // Assuming LOW means laser is aligned
-  digitalWrite(LASER_ALIGNED_LED, laserAligned ? HIGH : LOW);
+  // Update sensor status
+  updateLaserStatus();
   
-  // Send heartbeat
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastHeartbeatSent >= HEARTBEAT_INTERVAL) {
-    lastHeartbeatSent = currentMillis;
-    outgoingMessage.messageType = 0; // Heartbeat
-    outgoingMessage.status = true;
-    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
-  }
+  // Check connection status
+  checkConnection();
   
-  // Check if connection is active
-  if (currentMillis - lastHeartbeatReceived >= CONNECTION_TIMEOUT) {
-    connectionActive = false;
-    digitalWrite(CONNECTION_SUCCESS_LED, LOW);
-    digitalWrite(CONNECTION_FAIL_LED, HIGH);
-  }
+  // Update ready to time status
+  updateReadyToTime();
   
-  // Update ready to time state
-  bool newReadyState = laserAligned && connectionActive;
-  if (readyToTime != newReadyState) {
-    readyToTime = newReadyState;
-    digitalWrite(READY_LED, readyToTime ? HIGH : LOW);
-    
-    // Send ready state update to finish line
-    outgoingMessage.messageType = 2; // Ready state
-    outgoingMessage.status = readyToTime;
-    esp_now_send(broadcastAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
-    
-    // Beep when ready state changes
-    if (readyToTime) {
-      digitalWrite(BUZZER, HIGH);
-      delay(200);
-      digitalWrite(BUZZER, LOW);
-    }
-  }
-  
-  // Reset timing cycle if needed
-  if (timingCycleActive && !readyToTime) {
+  // Reset timing cycle if finish line is in cooldown mode
+  if (timingCycleActive && remoteCooldown) {
     timingCycleActive = false;
   }
   
-  delay(10); // Small delay to prevent CPU overload
+  // Small delay to prevent CPU hogging
+  delay(10);
 }
