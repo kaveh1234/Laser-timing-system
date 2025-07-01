@@ -1,0 +1,207 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+// Define pin assignments
+#define READY_LED 32
+#define LASER_ALIGNED_LED 33
+#define CONNECTION_FAIL_LED 25
+#define CONNECTION_SUCCESS_LED 26
+#define BUZZER 22
+#define LASER_SENSOR 23
+// CORRECTED: Using the MAC address from the finish line module code
+uint8_t finishLineMacAddress[] = {0xE8, 0x6B, 0xEA, 0xDF, 0xA2, 0x68};
+// Timing variables
+volatile bool laserAligned = false;
+bool connectionActive = false;
+bool readyToTime = false;
+bool timingCycleActive = false;
+// Frequency measurement variables
+volatile unsigned long pulseCount = 0;
+volatile unsigned long lastPulseTime = 0;
+unsigned long lastFreqCheck = 0;
+const unsigned long FREQ_CHECK_INTERVAL = 20; // Check frequency every 20ms
+float currentFrequency = 0;
+const float MIN_FREQUENCY = 1000.0; // 2000Hz - 1000Hz
+const float MAX_FREQUENCY = 3000.0; // 2000Hz + 1000Hz
+// Communication variables
+typedef struct struct_message {
+uint8_t msgType;  // 0 for heartbeat, 1 for start timing
+bool localAligned;
+bool cooldown;
+} struct_message;
+struct_message outgoingMsg;
+struct_message incomingMsg;
+// Last time we received a heartbeat from the finish line
+unsigned long lastHeartbeatReceived = 0;
+const unsigned long HEARTBEAT_TIMEOUT = 3000;  // 3 seconds timeout
+const unsigned long HEARTBEAT_INTERVAL = 1000; // Send heartbeat every 1 second
+unsigned long lastHeartbeatSent = 0;
+bool remoteAligned = false;
+bool remoteCooldown = false;
+// Function prototypes
+void sendHeartbeat();
+void sendStartSignal();
+void initESPNow();
+void updateReadyToTime();
+// Callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+if (status != ESP_NOW_SEND_SUCCESS) {
+digitalWrite(CONNECTION_FAIL_LED, HIGH);
+digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+connectionActive = false;
+} else {
+digitalWrite(CONNECTION_FAIL_LED, LOW);
+digitalWrite(CONNECTION_SUCCESS_LED, HIGH);
+}
+}
+// Callback when data is received - using the newer ESP-NOW API format
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+memcpy(&incomingMsg, incomingData, sizeof(incomingMsg));
+if (incomingMsg.msgType == 0) {  // Heartbeat message
+lastHeartbeatReceived = millis();
+connectionActive = true;
+remoteAligned = incomingMsg.localAligned;
+remoteCooldown = incomingMsg.cooldown;
+// Update ready to time status
+updateReadyToTime();
+}
+}
+// Interrupt service routine for pulse counting and break detection
+void IRAM_ATTR laserSensorISR() {
+unsigned long currentTime = micros();
+if (digitalRead(LASER_SENSOR) == HIGH) {
+// Rising edge - count pulse for frequency measurement
+pulseCount++;
+lastPulseTime = currentTime;
+} else {
+// Falling edge - check if this is a break event
+// If laser was aligned and we haven't seen a pulse in a while, it's a break
+if (laserAligned && readyToTime && !timingCycleActive &&
+(currentTime - lastPulseTime) > 5000) { // 5ms without pulse = break
+timingCycleActive = true;
+sendStartSignal();
+tone(BUZZER, 1000, 100);  // Beep to indicate timing start
+}
+}
+}
+// Update the laser aligned status with frequency check
+void updateLaserStatus() {
+// Calculate frequency periodically
+if (millis() - lastFreqCheck >= FREQ_CHECK_INTERVAL) {
+// Calculate frequency from pulse count
+noInterrupts();
+unsigned long count = pulseCount;
+pulseCount = 0;
+interrupts();
+// Convert to frequency (Hz)
+currentFrequency = (float)count * (1000.0 / FREQ_CHECK_INTERVAL);
+
+// Check if frequency is within acceptable range
+bool frequencyValid = (currentFrequency >= MIN_FREQUENCY && currentFrequency <= MAX_FREQUENCY);
+
+// Update laser aligned status
+laserAligned = frequencyValid;
+
+// Update LED
+digitalWrite(LASER_ALIGNED_LED, laserAligned ? HIGH : LOW);
+
+lastFreqCheck = millis();
+}
+}
+// Update the ready to time status
+void updateReadyToTime() {
+readyToTime = laserAligned && remoteAligned && connectionActive && !remoteCooldown && !timingCycleActive;
+digitalWrite(READY_LED, readyToTime ? HIGH : LOW);
+}
+// Initialize ESP-NOW
+void initESPNow() {
+WiFi.mode(WIFI_STA);
+if (esp_now_init() != ESP_OK) {
+Serial.println("Error initializing ESP-NOW");
+return;
+}
+esp_now_register_send_cb(OnDataSent);
+esp_now_peer_info_t peerInfo = {};
+memcpy(peerInfo.peer_addr, finishLineMacAddress, 6);
+peerInfo.channel = 0;
+peerInfo.encrypt = false;
+if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+Serial.println("Failed to add peer");
+return;
+}
+esp_now_register_recv_cb(OnDataRecv);
+}
+// Send heartbeat message to finish line module
+void sendHeartbeat() {
+outgoingMsg.msgType = 0;
+outgoingMsg.localAligned = laserAligned;
+outgoingMsg.cooldown = false;
+esp_err_t result = esp_now_send(finishLineMacAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+if (result != ESP_OK) {
+connectionActive = false;
+digitalWrite(CONNECTION_FAIL_LED, HIGH);
+digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+}
+}
+// Send start timing signal
+void sendStartSignal() {
+outgoingMsg.msgType = 1;  // Start timing message
+outgoingMsg.localAligned = laserAligned;
+outgoingMsg.cooldown = false;
+esp_err_t result = esp_now_send(finishLineMacAddress, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
+if (result != ESP_OK) {
+connectionActive = false;
+digitalWrite(CONNECTION_FAIL_LED, HIGH);
+digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+}
+}
+void checkConnection() {
+// Check if we haven't received a heartbeat for too long
+if (millis() - lastHeartbeatReceived > HEARTBEAT_TIMEOUT) {
+connectionActive = false;
+digitalWrite(CONNECTION_FAIL_LED, HIGH);
+digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+}
+// Send periodic heartbeats
+if (millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
+sendHeartbeat();
+lastHeartbeatSent = millis();
+}
+}
+void setup() {
+// Initialize serial for debugging
+Serial.begin(115200);
+// Initialize pins
+pinMode(READY_LED, OUTPUT);
+pinMode(LASER_ALIGNED_LED, OUTPUT);
+pinMode(CONNECTION_FAIL_LED, OUTPUT);
+pinMode(CONNECTION_SUCCESS_LED, OUTPUT);
+pinMode(BUZZER, OUTPUT);
+pinMode(LASER_SENSOR, INPUT);
+// Set initial LED states
+digitalWrite(READY_LED, LOW);
+digitalWrite(LASER_ALIGNED_LED, LOW);
+digitalWrite(CONNECTION_FAIL_LED, HIGH);
+digitalWrite(CONNECTION_SUCCESS_LED, LOW);
+// Initialize ESP-NOW
+initESPNow();
+// Attach interrupt for laser sensor - trigger on both edges
+attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), laserSensorISR, CHANGE);
+Serial.println("Start Line Module Initialized");
+Serial.println("Laser frequency detection enabled: 2000Hz ± 1000Hz");
+}
+void loop() {
+// Update sensor status
+updateLaserStatus();
+// Check connection status
+checkConnection();
+// Update ready to time status
+updateReadyToTime();
+// Reset timing cycle if finish line is in cooldown mode
+if (timingCycleActive && remoteCooldown) {
+timingCycleActive = false;
+}
+// Small delay to prevent CPU hogging
+delay(10);
+}
