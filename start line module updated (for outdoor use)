@@ -69,7 +69,7 @@ lastHeartbeatReceived = millis();
 connectionActive = true;
 remoteAligned = incomingMsg.localAligned;
 remoteCooldown = incomingMsg.cooldown;
-Copy// Update ready to time status
+// Update ready to time status
 updateReadyToTime();
 }
 }
@@ -125,7 +125,7 @@ noInterrupts();
 unsigned long count = pulseCount;
 pulseCount = 0;
 interrupts();
-Copy// Calculate frequency
+// Calculate frequency
 currentFrequency = (float)count * (1000.0 / FREQ_CHECK_INTERVAL);
 
 // Check if frequency is in valid range AND laser is detected
