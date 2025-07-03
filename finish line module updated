@@ -34,8 +34,8 @@ volatile unsigned long pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
 unsigned long lastFreqCheck = 0;
 const unsigned long FREQ_CHECK_INTERVAL = 250; // Check frequency every 250ms for stability
-const float TARGET_FREQ = 2000.0;
-const float FREQ_TOLERANCE = 1000.0;
+const float TARGET_FREQ = 150000.0;
+const float FREQ_TOLERANCE = 50000.0;
 float currentFrequency = 0.0;
 // Laser state tracking for stability
 bool laserDetectedRaw = false;
@@ -66,7 +66,8 @@ bool skipCooldownRequested = false;
 void IRAM_ATTR pulseCountISR() {
 unsigned long currentTime = micros();
 // Simple debounce - ignore pulses that come too fast (noise)
-if (currentTime - lastPulseTime > 100) { // 100 microseconds debounce
+// At 150kHz, period is ~6.67 microseconds, so 3 microsecond debounce
+if (currentTime - lastPulseTime > 3) { // 3 microseconds debounce
 pulseCount++;
 lastPulseTime = currentTime;
 }
@@ -201,10 +202,10 @@ status = "Align start laser";
 status = "Setting up...";
 }
 String json = "{";
-json += "\"time\":" + String(lastElapsedTime, 3) + ",";
-json += "\"status\":\"" + status + "\",";
-json += "\"timingActive\":" + String(timingActive ? "true" : "false") + ",";
-json += "\"cooldown\":" + String(cooldown ? "true" : "false");
+json += ""time":" + String(lastElapsedTime, 3) + ",";
+json += ""status":"" + status + "",";
+json += ""timingActive":" + String(timingActive ? "true" : "false") + ",";
+json += ""cooldown":" + String(cooldown ? "true" : "false");
 json += "}";
 server.send(200, "application/json", json);
 }
@@ -319,7 +320,7 @@ WiFi.setSleep(false);
 // Attach interrupt for frequency measurement on CHANGE to catch all transitions
 attachInterrupt(digitalPinToInterrupt(LASER_SENSOR), pulseCountISR, CHANGE);
 Serial.println("Finish Line Module Initialized");
-Serial.println("Target frequency: 2000Hz +/- 1000Hz");
+Serial.println("Target frequency: 150kHz +/- 50kHz");
 }
 void loop() {
 unsigned long currentMillis = millis();
